@@ -1,0 +1,250 @@
+================================================================================
+  NoScreen - Code Analysis Report
+  Generated: 2026-02-22
+================================================================================
+
+--------------------------------------------------------------------------------
+1. PROJECT OVERVIEW
+--------------------------------------------------------------------------------
+
+NoScreen is a Windows kernel-mode driver project that provides a stealth
+alternative to the Win32 API function SetWindowDisplayAffinity(). Its primary
+purpose is to hide a target application window from screen-capture tools
+(screenshots, recording software, etc.) without creating the detection vectors
+that the standard API exposes.
+
+The standard approach -- calling SetWindowDisplayAffinity(hwnd,
+WDA_EXCLUDEFROMCAPTURE) from user mode -- can be trivially detected by any
+process that calls GetWindowDisplayAffinity() on the same window. NoScreen
+bypasses this by invoking the underlying internal kernel function directly from
+a kernel driver, making the protection invisible to user-mode queries.
+
+Repository layout:
+
+  NoScreen/
+  ├── kernel/               Windows kernel-mode driver (Visual Studio solution)
+  │   └── kernel/
+  │       ├── entry.cpp     Driver entry point and IRP dispatch setup
+  │       └── library/
+  │           ├── globals.h  Kernel include aggregator
+  │           ├── stdint.h   Kernel-safe integer type definitions
+  │           ├── structs.h  Key kernel data structures + function pointer
+  │           ├── utils.h    Pattern scanning, module/export helpers, core logic
+  │           └── ioctl.h    IOCTL dispatch handler definitions
+  └── user/                 User-mode console application (Visual Studio solution)
+      └── user/
+          ├── entry.cpp     Application entry point
+          └── library/
+              ├── globals.h  User-mode include aggregator
+              └── ioctl.h    IOCTL code definitions + driver communication helpers
+
+
+--------------------------------------------------------------------------------
+2. KERNEL DRIVER (kernel/)
+--------------------------------------------------------------------------------
+
+Language / Target: C++ compiled as a Windows Kernel-Mode Driver (WDM)
+Build system:      Visual Studio / MSBuild (kernel.sln, kernel.vcxproj)
+Driver INF:        kernel.inf (installation descriptor for the driver service)
+
+2.1  Driver Entry Point  (kernel/kernel/entry.cpp)
+---------------------------------------------------
+Function: entry_point(PVOID, PVOID)
+  - Called by the OS when the driver image is loaded (mapped into kernel space).
+  - Calls IoCreateDriver() to register drv_main as the official DriverEntry.
+
+Function: drv_main(PDRIVER_OBJECT, PUNICODE_STRING)
+  - init_function() -- performs one-time pattern scanning (see §2.3).
+  - Creates a named kernel device object:  \Device\NoScreen
+  - Creates a DOS symbolic link:           \DosDevices\NoScreen
+    (This makes the device accessible from user mode as \\.\NoScreen)
+  - Configures the device for buffered I/O (DO_BUFFERED_IO).
+  - Registers IRP dispatch routines:
+      IRP_MJ_CREATE         -> create_io   (open handle -- succeeds silently)
+      IRP_MJ_CLOSE          -> close_io    (close handle -- succeeds silently)
+      IRP_MJ_DEVICE_CONTROL -> ctl_io      (IOCTL dispatch -- main logic)
+      All other functions   -> unsupported_io (returns STATUS_NOT_SUPPORTED)
+  - Sets DriverUnload to NULL (driver cannot be unloaded once started).
+
+2.2  IOCTL Dispatch  (kernel/kernel/library/ioctl.h)
+-----------------------------------------------------
+IOCTL code: ioctl_protect_sprite_content
+  Constructed via CTL_CODE with:
+    DeviceType = 0x3138  (file_device_mirrore)
+    Function   = 0x2056 + 0x0010 = 0x2066  (offset_io_mirrore + 0x10)
+    Method     = METHOD_BUFFERED
+    Access     = FILE_READ_ACCESS | FILE_WRITE_ACCESS
+
+Handler (ctl_io):
+  1. Retrieves the current IRP stack location to read the IOCTL code and buffer
+     lengths.
+  2. On receiving ioctl_protect_sprite_content:
+     - Validates that the input buffer is at least sizeof(protect_sprite_content).
+     - Calls protect_sprite_content_fn() with a pointer to the input buffer.
+  3. Any unrecognised IOCTL returns STATUS_INVALID_PARAMETER.
+  4. Completes the IRP with IofCompleteRequest().
+
+Input structure (protect_sprite_content):
+  uint32_t value          -- affinity value (mirrors WDA_* constants)
+  uint64_t window_handle  -- HWND of the target window cast to uint64_t
+
+2.3  Core Logic / Pattern Scanner  (kernel/kernel/library/utils.h)
+------------------------------------------------------------------
+init_function():
+  - Called once at driver load time.
+  - Scans the .text section of win32kfull.sys in kernel memory for the byte
+    pattern of an internal function call that precedes GreProtectSpriteContent:
+
+      Primary pattern (pre-24H2):
+        E8 ?? ?? ?? ?? 8B F8 85 C0 75 0E
+        (CALL rel32; MOV edi,eax; TEST eax,eax; JNZ +0Eh)
+
+      Fallback pattern (Windows 11 24H2):
+        E8 ?? ?? ?? ?? 8B D8 85 C0 75 0E
+        (CALL rel32; MOV ebx,eax; TEST eax,eax; JNZ +0Eh)
+
+  - Resolves the relative CALL target (E8 rel32) using the to_rva() macro to
+    obtain the absolute address of GreProtectSpriteContent.
+  - Stores the address in the global function pointer gre_protect_sprite_content.
+  - Returns STATUS_INVALID_ADDRESS if neither pattern is found.
+
+protect_sprite_content_fn(pprotect_sprite_content req):
+  - Calls gre_protect_sprite_content(0, req->window_handle, 1, req->value).
+  - This is a direct call to win32kfull!GreProtectSpriteContent, the kernel
+    internal that SetWindowDisplayAffinity() ultimately invokes.
+  - Returns STATUS_SUCCESS if the function returns non-zero, otherwise
+    STATUS_UNSUCCESSFUL.
+
+Helper utilities also present in utils.h:
+  ansi_to_unicode()         -- converts a C string to UNICODE_STRING
+  get_kernel_proc_address() -- wraps MmGetSystemRoutineAddress()
+  get_module_base()         -- walks PsLoadedModuleList to find a module by name
+  get_system_base_export()  -- resolves an exported symbol from a loaded module
+  get_ldr_data_by_name()    -- returns the KLDR_DATA_TABLE_ENTRY for a module
+  crt_strcmp()              -- simple case-insensitive wide/narrow string compare
+                               (kernel-safe, no CRT dependency)
+  get_section_header()      -- locates a PE section header by name
+  data_compare()            -- byte-pattern comparison with a wildcard mask
+  find_pattern()            -- linear byte-pattern scan over a memory range
+  find_pattern_page_km()    -- scans a specific PE section of a loaded module
+
+2.4  Data Structures  (kernel/kernel/library/structs.h)
+-------------------------------------------------------
+  LDR_DATA_TABLE_ENTRY    -- user-mode loader module list entry (re-declared for
+                             kernel use)
+  KLDR_DATA_TABLE_ENTRY   -- kernel loader module list entry with full field
+                             layout (offsets annotated)
+  gre_protect_sprite_content -- global function pointer (int64_t) used to hold
+                             the resolved address of GreProtectSpriteContent
+
+  External symbols imported:
+    PsLoadedModuleList              -- kernel module list head
+    RtlFindExportedRoutineByName()  -- resolve export from a module image
+    IoCreateDriver()                -- create a driver object programmatically
+
+
+--------------------------------------------------------------------------------
+3. USER-MODE APPLICATION (user/)
+--------------------------------------------------------------------------------
+
+Language / Target: C++ console application (Win32/x64)
+Build system:      Visual Studio / MSBuild (user.sln, user.vcxproj)
+
+3.1  Application Entry Point  (user/user/entry.cpp)
+----------------------------------------------------
+main():
+  1. Sets a blank console window title (stealth measure).
+  2. Calls service_is_load() -- opens a handle to \\.\NoScreen using
+     CreateFileW(). If the driver is not loaded, prints an error and exits.
+  3. Calls FindWindowW() to locate a window with the title "Cheat Engine 7.4".
+     If not found, prints an error and exits.
+  4. Calls protect_sprite_content_ex(window_handle, WDA_EXCLUDEFROMCAPTURE)
+     to send the IOCTL to the driver.
+  5. Reports success or failure and waits for a key press before exiting.
+
+3.2  Driver Communication  (user/user/library/ioctl.h)
+-------------------------------------------------------
+service_is_load():
+  - Opens \\.\NoScreen with GENERIC_READ | GENERIC_WRITE access.
+  - Returns true if the handle is valid (driver is loaded and device is present).
+
+send_service(ioctl_code, buffer, size):
+  - Sends a DeviceIoControl() call to the open driver handle.
+  - Returns STATUS_DEVICE_DOES_NOT_EXIST if no handle, STATUS_UNSUCCESSFUL on
+    DeviceIoControl failure, otherwise STATUS_SUCCESS.
+
+protect_sprite_content_ex(HWND, uint32_t value):
+  - Packs the HWND and value into a protect_sprite_content structure.
+  - Calls send_service() with ioctl_protect_sprite_content.
+
+
+--------------------------------------------------------------------------------
+4. HOW IT WORKS END-TO-END
+--------------------------------------------------------------------------------
+
+  [User Mode]                        [Kernel Mode]
+  ──────────────────────────────────────────────────────────────────────────────
+  1. Application opens \\.\NoScreen  ←  Driver loaded; device exists
+  2. FindWindowW("Cheat Engine 7.4") retrieves the target HWND
+  3. DeviceIoControl(IOCTL_PROTECT_SPRITE_CONTENT, {hwnd, WDA_EXCLUDEFROMCAPTURE})
+                                     →  ctl_io() receives the IRP
+                                        protect_sprite_content_fn() is called
+                                        GreProtectSpriteContent(0, hwnd, 1, WDA)
+                                        is called directly inside win32kfull.sys
+  4. STATUS_SUCCESS returned to user mode application
+
+  Result: The target window is excluded from screen capture. Unlike calling
+  SetWindowDisplayAffinity() from user mode, no user-mode-visible flag is set
+  on the window's HWND, so GetWindowDisplayAffinity() returns 0 (no affinity),
+  making the protection invisible to detection from user space.
+
+
+--------------------------------------------------------------------------------
+5. DETECTION AVOIDANCE MECHANISM
+--------------------------------------------------------------------------------
+
+Standard method (detectable):
+  User mode calls SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE)
+    -> Sets a user-visible flag on the window
+    -> GetWindowDisplayAffinity(hwnd, &affinity) returns WDA_EXCLUDEFROMCAPTURE
+    -> Any process can trivially detect this
+
+NoScreen method (not detectable from user mode):
+  Kernel driver calls win32kfull!GreProtectSpriteContent(0, hwnd, 1, value)
+    -> Applies the same underlying protection at the kernel level
+    -> No user-mode-visible flag is set on the window object
+    -> GetWindowDisplayAffinity() cannot observe the affinity
+    -> Protection does not touch the target process's memory at all
+
+
+--------------------------------------------------------------------------------
+6. WINDOWS VERSION COMPATIBILITY
+--------------------------------------------------------------------------------
+
+The driver supports multiple Windows versions by using two byte patterns during
+init_function():
+
+  Pre-Windows 11 24H2:  E8 ?? ?? ?? ?? 8B F8 85 C0 75 0E
+  Windows 11 24H2:      E8 ?? ?? ?? ?? 8B D8 85 C0 75 0E
+
+The only difference is whether the result of GreProtectSpriteContent is moved
+into EDI (8B F8) or EBX (8B D8), reflecting a compiler/code generation change
+between OS versions. The fallback pattern is tried automatically if the primary
+scan fails.
+
+
+--------------------------------------------------------------------------------
+7. SUMMARY
+--------------------------------------------------------------------------------
+
+NoScreen is a kernel-mode screen-capture evasion tool implemented as a Windows
+WDM driver paired with a user-mode console frontend. It is designed to hide any
+specified window (demonstrated with "Cheat Engine 7.4") from screenshot and
+screen-recording software by directly invoking the internal kernel graphics
+function GreProtectSpriteContent in win32kfull.sys via runtime pattern scanning,
+bypassing the standard SetWindowDisplayAffinity() API and its associated
+detection vectors entirely.
+
+================================================================================
+  End of Report
+================================================================================
